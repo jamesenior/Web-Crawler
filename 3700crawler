@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+
+from urllib.parse import urlparse
+import argparse
+import socket
+import threading
+import ssl
+from html.parser import HTMLParser
+from collections import deque
+
+# Define global variables.
+PORT_DEF = 443
+SERVER_DEF = "proj5.3700.network"
+flagsfound = []
+# Keeps track of buffered urls.
+bufflist = deque()
+# Keeps track of visited urls.
+visitlist = set()
+
+
+# Class representing an HTMLParser for our version of web crawler.
+class CustomHTMLParser(HTMLParser):
+    # Initialize a custom HTML Parser.
+    def __init__(slf, server, port):
+        HTMLParser.__init__(slf)
+        slf.server = server
+        slf.port = port
+
+    # Handle the HTML start tag.
+    def handle_starttag(slf, tag, attributes):
+        global bufflist
+        if tag == "a":
+            for key, value in attributes:
+                if value.startswith("/") and key == "href":
+                    url = "https://%s:%d%s" % (slf.server, slf.port, value)
+                    if url not in visitlist and url not in bufflist:
+                        bufflist.append(url)
+
+    # Handles data, prints flags when they are found.
+    def handle_data(slf, data):
+        global flagsfound
+        if "FLAG: " in data:
+            secret_flag = data.split(": ")[1]
+            flagsfound.append(secret_flag)
+            # print the flags as they are found
+            print(secret_flag)
+
+
+# Class representing the Web Crawler.
+class WebCrawler:
+    # Initializes the web crawler.
+    def __init__(slf, arguments):
+        slf.username = arguments.username
+        slf.password = arguments.password
+        slf.csrfToken = None
+        slf.sessionId = None
+        slf.server = arguments.server
+        slf.port = arguments.port
+
+    # Logs in to facebook.
+    def login(slf, url):
+        getresp = slf.http_send(url)
+        if getresp:
+            postresp = slf.post_http_send(url)
+            return postresp
+
+    # gets the CSRF token and Session ID
+    def get_cookies(slf):
+        cookies = dict()
+        if slf.csrfToken is not None:
+            cookies["csrftoken"] = slf.csrfToken
+        if slf.sessionId is not None:
+            cookies["sessionid"] = slf.sessionId
+        return cookies
+
+    # Constructs the cookie part of the request.  Helper function
+    def cookie_request_line(slf):
+        thiscook = ''
+        if slf.csrfToken is not None:
+            thiscook += 'csrftoken=%s' % slf.csrfToken
+        if slf.sessionId is not None:
+            thiscook += '; sessionid=%s' % slf.sessionId
+        if thiscook == '':
+            return ''
+        else:
+            return 'Cookie: %s' % thiscook
+
+    # Sends a HTTP request
+    def send_request(slf, request, url):
+        # Initialize socket connection
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        securesock = ssl.wrap_socket(s)
+        securesock.connect((slf.server, slf.port))
+        resp = ''
+        securesock.send(request.encode('utf-8'))
+        recvdata = securesock.recv(1000)
+        resp += recvdata.decode('utf-8')
+        while recvdata != b'':
+            recvdata = securesock.recv(1000)
+            resp += recvdata.decode('utf-8')
+        securesock.close()
+        if resp:
+            processed = slf.parse_response(resp)
+            return slf.parse_stat_code(processed, url)
+
+    # Processes an HTTP Response.
+    def parse_response(slf, responseget):
+        resp = {}
+        spl = responseget.split('\r\n\r\n')
+        heads = spl[0].split('\r\n')
+        statcode = heads[0].split(' ')[1]
+        resp["status"] = statcode.strip()
+        if len(spl) > 1:
+            body = spl[1]
+            resp["body"] = body
+        for head in heads[1:]:
+            (key, value) = head.split(":", 1)
+            if key == "Set-Cookie":
+                resptype = value.strip().split(";", 1)[0].split("=")[0]
+                resptok = value.split(";", 1)[0].split("=")[1]
+                if resptype == "csrftoken":
+                    slf.csrfToken = resptok
+                if resptype == "sessionid":
+                    slf.sessionId = resptok
+            if key == "Location":
+                resp["location"] = value.strip()
+        return resp
+
+    # Constructs and sends the http request.
+    def http_send(slf, url):
+        global visitlist
+        url_parsed = urlparse(url)
+        visitlist.add(url)
+        req = ''
+        if url in bufflist:
+            bufflist.remove(url)
+        if url_parsed.port == slf.port and url_parsed.hostname == slf.server:
+            # Construct request message
+            init_request = "GET %s HTTP/1.1\r\n" % url_parsed.path
+            req += init_request
+            req += "Host: %s\r\n" % slf.server
+            req += "Connection: Close\r\n"
+            cookiemess = slf.cookie_request_line()
+            if cookiemess != "":
+                req += "%s\r\n" % cookiemess
+            req += "\r\n"
+            return slf.send_request(req, url)
+
+    # Constructs and sends the HTTP Post request.
+    def post_http_send(slf, url):
+        visitlist.add(url)
+        req = ''
+        cont = "username=%s&password=%s&csrfmiddlewaretoken=%s&next=%s" % (
+            slf.username, slf.password, slf.csrfToken, "%2Ffakebook%2F")
+        # Construct the request message.
+        req += "POST /accounts/login/?next=/fakebook/ HTTP/1.1\r\n"
+        req += "Host: %s\r\n" % slf.server
+        req += "Connection: Close\r\n"
+        req += "Content-Type: application/x-www-form-urlencoded\r\n"
+        req += "Content-Length: %d\r\n" % len(cont)
+        # Add any cookies
+        if len(slf.cookie_request_line()) > 0:
+            req += slf.cookie_request_line() + "\r\n"
+        req += "\r\n"
+        req += cont
+        return slf.send_request(req, url)
+
+    # Handles the different status code numbers.
+
+    def parse_stat_code(slf, resp, url):
+        global visitlist
+        statcode = resp["status"]
+        # Return the response.
+        if statcode == "200":
+            return resp
+        elif statcode == "302":
+            oldpardesurl = urlparse(url)
+            newparsedurl = oldpardesurl.scheme + "://" + \
+                oldpardesurl.netloc + resp["location"]
+            bufflist.appendleft(newparsedurl)
+        # Abandon the url.
+        elif statcode == "404" or statcode == "403":
+            return None
+        elif statcode == "500":
+            print("Please contact course staff.")
+        elif statcode == "503":
+            bufflist.appendleft(url)
+            return None
+
+    # Function that runs this web crawler.
+    def run_crawler(slf):
+        global flagsfound
+        # First, login.
+        urllogin = "https://%s:%d/accounts/login/?next=/fakebook/" % (
+            slf.server, slf.port)
+        slf.login(urllogin)
+        # Create a parser for each flag.
+        par1 = CustomHTMLParser(slf.server, slf.port)
+        par2 = CustomHTMLParser(slf.server, slf.port)
+        par3 = CustomHTMLParser(slf.server, slf.port)
+        par4 = CustomHTMLParser(slf.server, slf.port)
+        par5 = CustomHTMLParser(slf.server, slf.port)
+        while len(flagsfound) < 5:
+            # create a thread for each flag as well.
+            thr1 = threading.Thread(target=slf.exec_crawl, args=(par1,))
+            thr2 = threading.Thread(target=slf.exec_crawl, args=(par2,))
+            thr3 = threading.Thread(target=slf.exec_crawl, args=(par3,))
+            thr4 = threading.Thread(target=slf.exec_crawl, args=(par4,))
+            thr5 = threading.Thread(target=slf.exec_crawl, args=(par5,))
+            # Start each thread
+            thr1.start()
+            thr2.start()
+            thr3.start()
+            thr4.start()
+            thr5.start()
+            # Now, join each thread when executed.
+            thr1.join()
+            thr2.join()
+            thr3.join()
+            thr4.join()
+            thr5.join()
+
+    # Function that does crawling, takes self and HTMLParser.
+    def exec_crawl(slf, htmlparser):
+        global bufflist
+        if len(bufflist) > 0:
+            url = bufflist.pop()
+            resp = slf.http_send(url)
+            if resp and resp["status"] == "200":
+                bod = resp["body"]
+                htmlparser.feed(bod)
+
+
+# Runs the main function of the webcrawler.
+if __name__ == "__main__":
+    argparser = argparse.ArgumentParser(description='Webcrawl facebook.')
+    # Add each argument to the parser.
+    argparser.add_argument('-s', dest="server", type=str,
+                           default=SERVER_DEF, help="The server being crawled.")
+    argparser.add_argument('-p', dest="port", type=int,
+                           default=PORT_DEF, help="Port that is in use.")
+    argparser.add_argument('username', type=str, help="Username of user.")
+    argparser.add_argument('password', type=str, help="Password of user.")
+    # Create parser and crawler, run the crawler.
+    args = argparser.parse_args()
+    crawler = WebCrawler(args)
+    crawler.run_crawler()
